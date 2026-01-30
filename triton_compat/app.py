@@ -32,10 +32,12 @@ def _set_status_and_raise(
     code: grpc.StatusCode,
     details: str,
 ) -> None:
+    # For Ray Serve gRPC proxy, it's enough to set the status code/details on the
+    # context and return an empty response message. Raising an exception causes
+    # noisy server-side stack traces for expected error cases (e.g. NOT_FOUND).
     if grpc_context is not None:
         grpc_context.set_code(code)
         grpc_context.set_details(details)
-    raise RuntimeError(details)
 
 
 def _validate_model_name(
@@ -45,8 +47,21 @@ def _validate_model_name(
         _set_status_and_raise(
             grpc_context,
             grpc.StatusCode.NOT_FOUND,
-            f"Unknown model: {model_name}",
+            f"Request for unknown model: '{model_name}' is not found",
         )
+        raise _ModelNotFound()
+
+
+class _ModelNotFound(Exception):
+    pass
+
+
+class _InvalidRequest(Exception):
+    pass
+
+
+class _Unimplemented(Exception):
+    pass
 
 
 def _stable_model_version(requested: str) -> str:
@@ -101,7 +116,10 @@ class TritonCompatDeployment:
         request: grpc_service_pb2.ModelReadyRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.ModelReadyResponse:
-        _validate_model_name(grpc_context, request.name)
+        try:
+            _validate_model_name(grpc_context, request.name)
+        except _ModelNotFound:
+            return grpc_service_pb2.ModelReadyResponse()
         return grpc_service_pb2.ModelReadyResponse(ready=True)
 
     def ServerMetadata(
@@ -118,7 +136,10 @@ class TritonCompatDeployment:
         request: grpc_service_pb2.ModelMetadataRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.ModelMetadataResponse:
-        _validate_model_name(grpc_context, request.name)
+        try:
+            _validate_model_name(grpc_context, request.name)
+        except _ModelNotFound:
+            return grpc_service_pb2.ModelMetadataResponse()
 
         resp = grpc_service_pb2.ModelMetadataResponse()
         resp.name = MODEL_NAME
@@ -144,7 +165,10 @@ class TritonCompatDeployment:
         request: grpc_service_pb2.ModelConfigRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.ModelConfigResponse:
-        _validate_model_name(grpc_context, request.name)
+        try:
+            _validate_model_name(grpc_context, request.name)
+        except _ModelNotFound:
+            return grpc_service_pb2.ModelConfigResponse()
 
         resp = grpc_service_pb2.ModelConfigResponse()
         resp.config.CopyFrom(_build_model_config())
@@ -155,7 +179,10 @@ class TritonCompatDeployment:
         request: grpc_service_pb2.ModelInferRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.ModelInferResponse:
-        _validate_model_name(grpc_context, request.model_name)
+        try:
+            _validate_model_name(grpc_context, request.model_name)
+        except _ModelNotFound:
+            return grpc_service_pb2.ModelInferResponse()
 
         if len(request.raw_input_contents) != len(request.inputs):
             _set_status_and_raise(
@@ -163,6 +190,7 @@ class TritonCompatDeployment:
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "raw_input_contents count must match inputs count",
             )
+            return grpc_service_pb2.ModelInferResponse()
 
         input_arrays: Dict[str, "object"] = {}
         for inp, raw in zip(request.inputs, request.raw_input_contents):
@@ -174,24 +202,28 @@ class TritonCompatDeployment:
                         grpc.StatusCode.UNIMPLEMENTED,
                         "Shared memory is not supported in MVP",
                     )
+                    return grpc_service_pb2.ModelInferResponse()
             if inp.name not in ("INPUT0", "INPUT1"):
                 _set_status_and_raise(
                     grpc_context,
                     grpc.StatusCode.INVALID_ARGUMENT,
                     f"Unexpected input name: {inp.name}",
                 )
+                return grpc_service_pb2.ModelInferResponse()
             if inp.datatype != "INT32":
                 _set_status_and_raise(
                     grpc_context,
                     grpc.StatusCode.INVALID_ARGUMENT,
                     f"Unexpected datatype for {inp.name}: {inp.datatype}",
                 )
+                return grpc_service_pb2.ModelInferResponse()
             if list(inp.shape) != [1, 16]:
                 _set_status_and_raise(
                     grpc_context,
                     grpc.StatusCode.INVALID_ARGUMENT,
                     f"Unexpected shape for {inp.name}: {list(inp.shape)}",
                 )
+                return grpc_service_pb2.ModelInferResponse()
 
             # INT32 input (little-endian, row-major).
             if len(raw) != 1 * 16 * 4:
@@ -200,6 +232,7 @@ class TritonCompatDeployment:
                     grpc.StatusCode.INVALID_ARGUMENT,
                     f"Raw buffer size mismatch for {inp.name}",
                 )
+                return grpc_service_pb2.ModelInferResponse()
             import numpy as np
 
             input_arrays[inp.name] = np.frombuffer(raw, dtype="<i4").reshape((1, 16))
@@ -210,6 +243,7 @@ class TritonCompatDeployment:
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "Both INPUT0 and INPUT1 are required",
             )
+            return grpc_service_pb2.ModelInferResponse()
 
         outputs_np = infer_simple(input_arrays["INPUT0"], input_arrays["INPUT1"])
 
@@ -230,6 +264,7 @@ class TritonCompatDeployment:
                     grpc.StatusCode.INVALID_ARGUMENT,
                     f"Unexpected requested output name: {out_name}",
                 )
+                return grpc_service_pb2.ModelInferResponse()
             out_arr = outputs_np[out_name]
             ot = resp.outputs.add()
             ot.name = out_name
@@ -264,97 +299,139 @@ class TritonCompatDeployment:
             grpc.StatusCode.UNIMPLEMENTED,
             f"{method} is not implemented in MVP",
         )
+        raise _Unimplemented()
 
     def ModelStatistics(
         self,
         request: grpc_service_pb2.ModelStatisticsRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.ModelStatisticsResponse:
-        self._unimplemented(grpc_context, "ModelStatistics")
+        try:
+            self._unimplemented(grpc_context, "ModelStatistics")
+        except _Unimplemented:
+            return grpc_service_pb2.ModelStatisticsResponse()
 
     def RepositoryIndex(
         self,
         request: grpc_service_pb2.RepositoryIndexRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.RepositoryIndexResponse:
-        self._unimplemented(grpc_context, "RepositoryIndex")
+        try:
+            self._unimplemented(grpc_context, "RepositoryIndex")
+        except _Unimplemented:
+            return grpc_service_pb2.RepositoryIndexResponse()
 
     def RepositoryModelLoad(
         self,
         request: grpc_service_pb2.RepositoryModelLoadRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.RepositoryModelLoadResponse:
-        self._unimplemented(grpc_context, "RepositoryModelLoad")
+        try:
+            self._unimplemented(grpc_context, "RepositoryModelLoad")
+        except _Unimplemented:
+            return grpc_service_pb2.RepositoryModelLoadResponse()
 
     def RepositoryModelUnload(
         self,
         request: grpc_service_pb2.RepositoryModelUnloadRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.RepositoryModelUnloadResponse:
-        self._unimplemented(grpc_context, "RepositoryModelUnload")
+        try:
+            self._unimplemented(grpc_context, "RepositoryModelUnload")
+        except _Unimplemented:
+            return grpc_service_pb2.RepositoryModelUnloadResponse()
 
     def SystemSharedMemoryStatus(
         self,
         request: grpc_service_pb2.SystemSharedMemoryStatusRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.SystemSharedMemoryStatusResponse:
-        self._unimplemented(grpc_context, "SystemSharedMemoryStatus")
+        try:
+            self._unimplemented(grpc_context, "SystemSharedMemoryStatus")
+        except _Unimplemented:
+            return grpc_service_pb2.SystemSharedMemoryStatusResponse()
 
     def SystemSharedMemoryRegister(
         self,
         request: grpc_service_pb2.SystemSharedMemoryRegisterRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.SystemSharedMemoryRegisterResponse:
-        self._unimplemented(grpc_context, "SystemSharedMemoryRegister")
+        try:
+            self._unimplemented(grpc_context, "SystemSharedMemoryRegister")
+        except _Unimplemented:
+            return grpc_service_pb2.SystemSharedMemoryRegisterResponse()
 
     def SystemSharedMemoryUnregister(
         self,
         request: grpc_service_pb2.SystemSharedMemoryUnregisterRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.SystemSharedMemoryUnregisterResponse:
-        self._unimplemented(grpc_context, "SystemSharedMemoryUnregister")
+        try:
+            self._unimplemented(grpc_context, "SystemSharedMemoryUnregister")
+        except _Unimplemented:
+            return grpc_service_pb2.SystemSharedMemoryUnregisterResponse()
 
     def CudaSharedMemoryStatus(
         self,
         request: grpc_service_pb2.CudaSharedMemoryStatusRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.CudaSharedMemoryStatusResponse:
-        self._unimplemented(grpc_context, "CudaSharedMemoryStatus")
+        try:
+            self._unimplemented(grpc_context, "CudaSharedMemoryStatus")
+        except _Unimplemented:
+            return grpc_service_pb2.CudaSharedMemoryStatusResponse()
 
     def CudaSharedMemoryRegister(
         self,
         request: grpc_service_pb2.CudaSharedMemoryRegisterRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.CudaSharedMemoryRegisterResponse:
-        self._unimplemented(grpc_context, "CudaSharedMemoryRegister")
+        try:
+            self._unimplemented(grpc_context, "CudaSharedMemoryRegister")
+        except _Unimplemented:
+            return grpc_service_pb2.CudaSharedMemoryRegisterResponse()
 
     def CudaSharedMemoryUnregister(
         self,
         request: grpc_service_pb2.CudaSharedMemoryUnregisterRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.CudaSharedMemoryUnregisterResponse:
-        self._unimplemented(grpc_context, "CudaSharedMemoryUnregister")
+        try:
+            self._unimplemented(grpc_context, "CudaSharedMemoryUnregister")
+        except _Unimplemented:
+            return grpc_service_pb2.CudaSharedMemoryUnregisterResponse()
 
     def TraceSetting(
         self,
         request: grpc_service_pb2.TraceSettingRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.TraceSettingResponse:
-        self._unimplemented(grpc_context, "TraceSetting")
+        try:
+            self._unimplemented(grpc_context, "TraceSetting")
+        except _Unimplemented:
+            return grpc_service_pb2.TraceSettingResponse()
 
     def LogSettings(
         self,
         request: grpc_service_pb2.LogSettingsRequest,
         grpc_context: Optional[RayServegRPCContext] = None,
     ) -> grpc_service_pb2.LogSettingsResponse:
-        self._unimplemented(grpc_context, "LogSettings")
+        try:
+            self._unimplemented(grpc_context, "LogSettings")
+        except _Unimplemented:
+            return grpc_service_pb2.LogSettingsResponse()
 
     # NOTE: Triton defines ModelStreamInfer as bidirectional streaming.
     # Ray Serve's gRPC proxy does not override stream-stream handlers, so this
     # method may not be invoked. It is included for completeness.
     def ModelStreamInfer(self, *args, **kwargs):
         grpc_context = kwargs.get("grpc_context")
-        self._unimplemented(grpc_context, "ModelStreamInfer")
+        try:
+            self._unimplemented(grpc_context, "ModelStreamInfer")
+        except _Unimplemented:
+            # Triton ModelStreamInfer returns ModelStreamInferResponse on the wire,
+            # but this method isn't expected to be invoked in this MVP.
+            return None
 
 
 app = TritonCompatDeployment.bind()

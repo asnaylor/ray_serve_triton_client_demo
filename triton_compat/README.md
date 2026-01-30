@@ -90,10 +90,7 @@ Run the examples against the Ray Serve gRPC proxy on `localhost:8001`:
 ```bash
 ./build/triton_client_cc/examples/simple_grpc_health_metadata -u localhost:8001
 ./build/triton_client_cc/examples/simple_grpc_infer_client -u localhost:8001
-```
-
-Success criteria for inference is:
-
-```
-PASS : Infer
+./build/triton_client_cc/examples/simple_grpc_async_infer_client -u localhost:8001
+./build/triton_client_cc/examples/simple_grpc_custom_args_client -u localhost:8001
+./build/triton_client_cc/examples/simple_grpc_keepalive_client -u localhost:8001
 ```
